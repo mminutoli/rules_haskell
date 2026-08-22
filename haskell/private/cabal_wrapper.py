@@ -110,13 +110,31 @@ extra_ldflags_file = json_args["extra_ldflags_file"]
 execroot = os.getcwd()
 setup = os.path.join(execroot, json_args["setup_path"])
 srcdir = os.path.join(execroot, json_args["pkg_dir"])
+
+# Scan the sandbox (execroot) for any dependency data directories
+# and set their corresponding <pkgname>_datadir environment variables.
+for root, dirs, files in os.walk(execroot):
+    for d in dirs:
+        m = re.match(r'^([a-zA-Z0-9_-]+)-[0-9.]+_data$', d)
+        if m:
+            pkgname = m.group(1)
+            env_var = pkgname.replace("-", "_") + "_datadir"
+            if env_var not in os.environ:
+                os.environ[env_var] = os.path.join(root, d)
+
 # By definition (see ghc-pkg source code).
 rel_pkgroot = os.path.dirname(json_args["package_db_path"])
 pkgroot = os.path.realpath(os.path.join(execroot, rel_pkgroot))
 libdir = os.path.join(pkgroot, "{}_iface".format(name))
 dynlibdir = os.path.join(pkgroot, "lib")
 bindir = os.path.join(pkgroot, "bin")
-datadir = os.path.join(pkgroot, "{}_data".format(name))
+expected_datadir = os.path.join(pkgroot, "{}_data".format(name))
+m_clean = re.match(r'^([a-zA-Z0-9_-]+)-([0-9.]+)', name)
+if m_clean:
+    package_id_clean = m_clean.group(1) + "-" + m_clean.group(2)
+else:
+    package_id_clean = name
+datadir = os.path.join(pkgroot, "{}_data".format(package_id_clean))
 package_database = os.path.join(pkgroot, "{}.conf.d".format(name))
 haddockdir = os.path.join(pkgroot, "{}_haddock".format(name))
 htmldir = os.path.join(pkgroot, "{}_haddock_html".format(name))
@@ -354,6 +372,41 @@ with mkdtemp(distdir_prefix()) as distdir, init_deps_db() as deps_package_db:
     # package-db.
     # See https://github.com/haskell/cabal/issues/1317#issuecomment-1025942396
     run([runghc] + runghc_args + [setup, "copy", "--verbose=0", "--builddir=" + distdir])
+    if haddock:
+        m = re.match(r'^([a-zA-Z0-9_-]+)-[0-9.]+', name)
+        if m:
+            package_name = m.group(1)
+        else:
+            package_name = name
+        expected_path = os.path.join(haddockdir, package_name + ".haddock")
+        if not os.path.exists(expected_path):
+            found_haddock = None
+            for root, dirs, files in os.walk(pkgroot):
+                for f in files:
+                    if f.endswith(".haddock"):
+                        found_haddock = os.path.join(root, f)
+                        break
+                if found_haddock:
+                    break
+            if found_haddock:
+                if not os.path.exists(haddockdir):
+                    os.makedirs(haddockdir)
+                shutil.copyfile(found_haddock, expected_path)
+
+    # Set environment variables for dependencies' data directories
+    for db in deps_package_databases:
+        real_db = os.path.realpath(os.path.join(execroot, db))
+        dep_install_root = os.path.dirname(os.path.dirname(real_db))
+        if os.path.exists(dep_install_root):
+            for item in os.listdir(dep_install_root):
+                m = re.match(r'^([a-zA-Z0-9_-]+)-[0-9.]+_data$', item)
+                if m:
+                    pkgname = m.group(1)
+                    env_var = pkgname.replace("-", "_") + "_datadir"
+                    src_data_dir = os.path.join(dep_install_root, item)
+                    if os.path.isdir(src_data_dir):
+                        os.environ[env_var] = src_data_dir
+
     if component.startswith("lib"):
         run([runghc] + runghc_args + [setup, "register", "--gen-pkg-config=" + os.path.join(package_database, name + ".conf"), "--verbose=0", "--builddir=" + distdir])
     # Bazel builds are not sandboxed on Windows and can be non-sandboxed on
@@ -407,3 +460,6 @@ if os.path.isfile(package_conf_file):
     os.remove(package_conf_file)
     os.rename(tmp_package_conf_file, package_conf_file)
     recache_db()
+
+if not os.path.exists(expected_datadir):
+    os.makedirs(expected_datadir)

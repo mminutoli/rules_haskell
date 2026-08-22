@@ -199,7 +199,8 @@ def _prepare_cabal_inputs(
         is_library = False,  # @unused
         dynamic_file = None,
         static_binary = True,
-        label = None):
+        label = None,
+        extra_inputs = depset([])):
     """Compute Cabal wrapper, arguments, inputs."""
     with_profiling = is_profiling_enabled(hs)
 
@@ -404,6 +405,7 @@ def _prepare_cabal_inputs(
             dep_info.interface_dirs,
             dep_info.hs_libraries,
             tool_inputs,
+            extra_inputs,
         ],
     )
     input_manifests = tool_input_manifests + hs.toolchain.cc_wrapper.manifests
@@ -606,6 +608,7 @@ def _haskell_cabal_library_impl(ctx):
         dynamic_file = dynamic_library,
         transitive_haddocks = _gather_transitive_haddocks(ctx.attr.deps) if with_haddock else depset([]),
         label = ctx.label,
+        extra_inputs = depset(transitive = [dep[DefaultInfo].files for dep in ctx.attr.deps if DefaultInfo in dep]),
     )
     outputs = [
         package_database,
@@ -942,6 +945,7 @@ def _haskell_cabal_binary_impl(ctx):
         transitive_haddocks = _gather_transitive_haddocks(ctx.attr.deps) if hs.tools_config.supports_haddock else depset([]),
         static_binary = static_binary,
         label = ctx.label,
+        extra_inputs = depset(transitive = [dep[DefaultInfo].files for dep in ctx.attr.deps if DefaultInfo in dep]),
     )
     (_, runghc_manifest) = ctx.resolve_tools(tools = [ctx.attr._runghc])
     json_args = ctx.actions.declare_file("{}_cabal_wrapper_args.json".format(ctx.label.name))
@@ -1942,6 +1946,71 @@ Try to regenerate it by running the following command:
 
     return pinned
 
+def _extract_cabal_deps(text, deps_list):
+    parts = text.split(",")
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        words = [w for w in part.split(" ") if w]
+        if words:
+            pkg = words[0].strip()
+            if ":" in pkg:
+                pkg = pkg.split(":")[0].strip()
+            if pkg and pkg not in deps_list:
+                deps_list.append(pkg)
+
+def _parse_cabal_components_content(content, name):
+    components = {}
+    stanzas = []
+    current_stanza = None
+    in_library_stanza = False
+    in_build_depends = False
+
+    lines = content.split("\n")
+    for line in lines:
+        if "--" in line:
+            line = line[:line.find("--")]
+        stripped = line.strip()
+
+        is_top_level = line and not line.startswith(" ") and not line.startswith("\t")
+
+        if is_top_level and stripped.lower().startswith("library"):
+            parts = [p for p in stripped.split(" ") if p]
+            if len(parts) > 1:
+                comp_name = "lib:" + parts[1]
+            else:
+                comp_name = "lib"
+            current_stanza = {"name": comp_name, "deps": [], "has_modules": False}
+            stanzas.append(current_stanza)
+            in_library_stanza = True
+            in_build_depends = False
+        elif is_top_level and stripped:
+            in_library_stanza = False
+            current_stanza = None
+            in_build_depends = False
+
+        if in_library_stanza and current_stanza:
+            if stripped.lower().startswith("build-depends:"):
+                in_build_depends = True
+                dep_content = stripped[len("build-depends:"):]
+                _extract_cabal_deps(dep_content, current_stanza["deps"])
+            elif stripped.lower().startswith("exposed-modules:") or stripped.lower().startswith("other-modules:"):
+                current_stanza["has_modules"] = True
+                in_build_depends = False
+            elif in_build_depends:
+                if line.startswith(" ") or line.startswith("\t"):
+                    _extract_cabal_deps(stripped, current_stanza["deps"])
+                else:
+                    in_build_depends = False
+
+    for stanza in stanzas:
+        components[stanza["name"]] = struct(
+            deps = stanza["deps"],
+            is_empty = not stanza["has_modules"]
+        )
+    return components
+
 def _stack_snapshot_unpinned_impl(repository_ctx):
     snapshot = _parse_stack_snapshot(
         repository_ctx,
@@ -2067,20 +2136,63 @@ def _stack_snapshot_impl(repository_ctx):
         _parse_components_args_key(component): args
         for (component, args) in repository_ctx.attr.components_args.items()
     }
+    components_dependencies = {}
+    empty_libraries = {}
+    for comp, deps in repository_ctx.attr.components_dependencies.items():
+        components_dependencies[comp] = json.decode(deps)
+
     for (name, spec) in resolved.items():
-        all_components[name] = _get_components(user_components, name)
+        comps = _get_components(user_components, name)
         user_components.pop(name, None)
+
+        # If it's a downloaded package, automatically scan its .cabal file
+        if spec["location"]["type"] not in ["core", "vendored"]:
+            cabal_path = "{}-{}/{}.cabal".format(name, spec["version"], name)
+            cabal_content = repository_ctx.read(cabal_path)
+            detected = _parse_cabal_components_content(cabal_content, name)
+
+            # Check if the main library is empty
+            if "lib" in detected and detected["lib"].is_empty:
+                empty_libraries[name] = True
+
+            # Find detected sublibraries
+            detected_sublibs = []
+            for comp in detected.keys():
+                if comp.startswith("lib:"):
+                    detected_sublibs.append(comp[4:])
+
+            if detected_sublibs:
+                # Merge sublibraries
+                merged_sublibs = list(comps.sublibs)
+                for sub in detected_sublibs:
+                    if sub not in merged_sublibs:
+                        merged_sublibs.append(sub)
+                comps = struct(lib = comps.lib, exe = comps.exe, sublibs = merged_sublibs)
+
+                # Merge internal dependencies
+                if name not in components_dependencies:
+                    components_dependencies[name] = {}
+                for comp, deps_struct in detected.items():
+                    internal_deps = []
+                    for dep in deps_struct.deps:
+                        if dep in detected_sublibs:
+                            internal_deps.append("lib:{}".format(dep))
+
+                    # Update components_dependencies for the package
+                    existing_deps = components_dependencies[name].get(comp, [])
+                    for d in internal_deps:
+                        if d not in existing_deps:
+                            existing_deps.append(d)
+                    components_dependencies[name][comp] = existing_deps
+
+        all_components[name] = comps
+
     for package in user_components.keys():
         if not package in _default_components:
             fail("Unknown package: %s" % package, "components")
 
     extra_deps = _to_string_keyed_label_list_dict(repository_ctx.attr.extra_deps)
     tools = [_label_to_string(label) for label in repository_ctx.attr.tools]
-
-    components_dependencies = {
-        comp: json.decode(deps)
-        for comp, deps in repository_ctx.attr.components_dependencies.items()
-    }
 
     # Write out dependency graph as importable Starlark value.
     repository_ctx.file(
@@ -2186,6 +2298,8 @@ haskell_toolchain_library(name = "{name}", visibility = {visibility})
             cabal_args = ""
             if lib_args != None:
                 cabal_args = "cabal_args = \"{}\",".format(lib_args)
+            elif empty_libraries.get(name, False):
+                cabal_args = "cabal_args = \"@rules_haskell//haskell/cabal:empty_library\","
 
             if all_components[name].lib:
                 build_file_builder.append(

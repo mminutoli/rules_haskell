@@ -153,7 +153,7 @@ def ghc_pkg_recache(hs, posix, conf_file):
 
     # Make the call to ghc-pkg and use the package configuration file
     hs.actions.run(
-        inputs = depset(direct = [conf_file]),
+        inputs = depset(direct = [conf_file], transitive = [depset(hs.toolchain.libdir)]),
         outputs = [cache_file],
         mnemonic = "HaskellRegisterPackage",
         progress_message = "HaskellRegisterPackage {}".format(conf_file.short_path),
@@ -188,6 +188,9 @@ def ghc_pkg_recache(hs, posix, conf_file):
         ],
         env = {
             "PATH": (";" if hs.toolchain.is_windows else ":").join(posix.paths),
+        },
+        execution_requirements = {
+            "no-remote": "1",
         },
     )
 

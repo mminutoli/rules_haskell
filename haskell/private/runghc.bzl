@@ -38,7 +38,7 @@ subprocess.run([r.Rlocation("{runghc}")] + sys.argv[1:], check=True)
     return [DefaultInfo(
         executable = runghc_wrapper_file,
         runfiles = hs_toolchain.cc_wrapper.runfiles.merge(
-            ctx.runfiles(files = [runghc_wrapper_file, hs_toolchain.tools.runghc]),
+            ctx.runfiles(files = [runghc_wrapper_file, hs_toolchain.tools.runghc] + hs_toolchain.libdir + hs_toolchain.bindir),
         ),
     )]
 
